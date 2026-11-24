@@ -1,0 +1,61 @@
+name: Release Changelog
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  changelog:
+    name: 把 CHANGELOG 该版本内容写入 release
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出发布标签对应的代码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: 提取并写入 release 正文
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+
+          # 提取 CHANGELOG.md 中 [VERSION] 段落：从该标题起，到下一个 ## 标题为止
+          SECTION="$(awk -v version="$VERSION" '
+            /^## \[/ {
+              if (grab) exit 0
+              head = $0
+              sub(/^## \[/, "", head)
+              sub(/\].*/, "", head)
+              if (head == version) { grab = 1; print; next }
+              next
+            }
+            grab { print }
+          ' CHANGELOG.md)"
+
+          if [ -z "$SECTION" ]; then
+            echo "::error::CHANGELOG.md 中没有 [$VERSION] 段落，发布前请先把该版本的变更整理到该标题下"
+            exit 1
+          fi
+
+          CURRENT="$(gh release view "$TAG" -R "$REPO" --json body -q .body)"
+
+          # 幂等：正文已包含该段落就不再重复写
+          if printf '%s\n' "$CURRENT" | grep -qxF "$(printf '%s\n' "$SECTION" | head -n 1)"; then
+            echo "release 正文已包含 [$VERSION] 段落，跳过"
+            exit 0
+          fi
+
+          if [ -n "$CURRENT" ]; then
+            printf '%s\n\n%s\n' "$CURRENT" "$SECTION" > release-notes.md
+          else
+            printf '%s\n' "$SECTION" > release-notes.md
+          fi
+          gh release edit "$TAG" -R "$REPO" --notes-file release-notes.md
+          echo "已把 [$VERSION] 的 CHANGELOG 内容写入 release 正文"

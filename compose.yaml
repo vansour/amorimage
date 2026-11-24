@@ -1,0 +1,18 @@
+services:
+  amorimage:
+    build: .
+    image: ghcr.io/vansour/amorimage
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      AMOR_BIND: 0.0.0.0:3000
+      AMOR_DB_DIR: /var/lib/amorimage/db
+      AMOR_STORAGE_DIR: /var/lib/amorimage/storage
+      # 访问令牌从同目录 .env 读取（compose 自动加载；参考 .env.example），
+      # 留空或没有 .env 则为开放模式
+      AMOR_TOKEN: ${AMOR_TOKEN:-}
+      # AMOR_BASE_URL: 可选强制覆盖，默认复制链接自动采用浏览器访问地址
+    volumes:
+      - ./data/db:/var/lib/amorimage/db
+      - ./data/storage:/var/lib/amorimage/storage
