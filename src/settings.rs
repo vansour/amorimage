@@ -22,14 +22,46 @@ pub async fn get(State(st): State<AppState>) -> Result<Json<serde_json::Value>, 
     let theme = stored_theme(&st).await;
     let max_file_mb = stored_max_file_mb(&st).await;
     let max_body_mb = stored_max_body_mb(&st).await;
-    let has_favicon = matches!(db::settings_get(&st.pool, "favicon").await?, Some(_));
+    let has_favicon = db::settings_get(&st.pool, "favicon").await?.is_some();
+    let storage = storage_settings(&st).await;
     Ok(Json(json!({
         "title": title,
         "theme": theme,
         "max_file_mb": max_file_mb,
         "max_body_mb": max_body_mb,
         "has_favicon": has_favicon,
+        "storage": storage,
     })))
+}
+
+/// 存储配置里密钥只回传「是否已设置」，避免从接口把密钥读走
+async fn storage_settings(st: &AppState) -> serde_json::Value {
+    let text = |key: &'static str| {
+        let st = st.clone();
+        async move { setting(&st, key).await.unwrap_or_default() }
+    };
+    json!({
+        "backend": setting(st, "storage_backend").await.unwrap_or_else(|| "local".into()),
+        "webdav_url": text("webdav_url").await,
+        "webdav_username": text("webdav_username").await,
+        "webdav_has_password": db::settings_get(&st.pool, "webdav_password").await.ok().flatten().is_some_and(|v| !v.is_empty()),
+        "s3_endpoint": text("s3_endpoint").await,
+        "s3_bucket": text("s3_bucket").await,
+        "s3_region": text("s3_region").await,
+        "s3_access_key": text("s3_access_key").await,
+        "s3_has_secret": db::settings_get(&st.pool, "s3_secret_key").await.ok().flatten().is_some_and(|v| !v.is_empty()),
+        "s3_path_style": setting(st, "s3_path_style").await.as_deref() != Some("0"),
+    })
+}
+
+async fn setting(st: &AppState, key: &'static str) -> Option<String> {
+    db::settings_get(&st.pool, key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| String::from_utf8(v).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 pub async fn stored_title(st: &AppState) -> String {
@@ -81,6 +113,23 @@ pub struct SettingsPatch {
     theme: Option<String>,
     max_file_mb: Option<u64>,
     max_body_mb: Option<u64>,
+    #[serde(default)]
+    storage: Option<StoragePatch>,
+}
+
+#[derive(Deserialize)]
+pub struct StoragePatch {
+    backend: Option<String>,
+    webdav_url: Option<String>,
+    webdav_username: Option<String>,
+    /// 传空字符串表示保留原密码，单独传 clear 才清空
+    webdav_password: Option<String>,
+    s3_endpoint: Option<String>,
+    s3_bucket: Option<String>,
+    s3_region: Option<String>,
+    s3_access_key: Option<String>,
+    s3_secret_key: Option<String>,
+    s3_path_style: Option<bool>,
 }
 
 pub async fn update(
@@ -114,7 +163,150 @@ pub async fn update(
         // 0 表示无限制
         db::settings_set(&st.pool, "max_body_mb", mb.to_string().as_bytes()).await?;
     }
+    if let Some(s) = &p.storage {
+        update_storage(&st, s).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_storage(st: &AppState, s: &StoragePatch) -> Result<(), AppError> {
+    if let Some(backend) = &s.backend {
+        if !matches!(backend.as_str(), "local" | "webdav" | "s3") {
+            return Err(AppError::BadRequest("存储后端只能是 local / webdav / s3".into()));
+        }
+        db::settings_set(&st.pool, "storage_backend", backend.as_bytes()).await?;
+    }
+
+    // 地址类配置必须是 http(s)，否则后端每条请求都会失败
+    for (key, value) in [
+        ("webdav_url", &s.webdav_url),
+        ("s3_endpoint", &s.s3_endpoint),
+    ] {
+        if let Some(url) = value {
+            let url = url.trim();
+            if !url.is_empty() && !(url.starts_with("https://") || url.starts_with("http://")) {
+                return Err(AppError::BadRequest(format!("{key} 必须以 http:// 或 https:// 开头")));
+            }
+            db::settings_set(&st.pool, key, url.as_bytes()).await?;
+        }
+    }
+    for (key, value) in [
+        ("webdav_username", &s.webdav_username),
+        ("s3_bucket", &s.s3_bucket),
+        ("s3_region", &s.s3_region),
+        ("s3_access_key", &s.s3_access_key),
+    ] {
+        if let Some(v) = value {
+            let v = v.trim();
+            if key == "s3_bucket" && v.contains(['/', '\\', ' ']) {
+                return Err(AppError::BadRequest("存储桶名称不能包含斜杠或空格".into()));
+            }
+            db::settings_set(&st.pool, key, v.as_bytes()).await?;
+        }
+    }
+    // 密钥留空表示不改动，避免前端回显密钥的往返把它们清空
+    if let Some(pw) = s.webdav_password.as_ref().filter(|v| !v.is_empty()) {
+        db::settings_set(&st.pool, "webdav_password", pw.as_bytes()).await?;
+    }
+    if let Some(secret) = s.s3_secret_key.as_ref().filter(|v| !v.is_empty()) {
+        db::settings_set(&st.pool, "s3_secret_key", secret.as_bytes()).await?;
+    }
+    if let Some(path_style) = s.s3_path_style {
+        db::settings_set(&st.pool, "s3_path_style", if path_style { b"1" } else { b"0" }).await?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct ProbeBody {
+    storage: StoragePatch,
+}
+
+/// 用请求里带的配置直接试连，不必先保存——避免把错配置落库、影响正在用的上传
+pub async fn probe_storage(
+    State(st): State<AppState>,
+    Json(body): Json<ProbeBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let s = &body.storage;
+    let backend = s
+        .backend
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("缺少存储后端类型".into()))?;
+    let saved = |key: &'static str| {
+        let st = st.clone();
+        async move { setting(&st, key).await }
+    };
+    let backend = match backend {
+        "local" => {
+            return Ok(Json(json!({ "ok": true, "message": "本地磁盘可用" })));
+        }
+        "webdav" => {
+            let url = s.webdav_url.as_deref().map(str::trim).filter(|v| !v.is_empty());
+            let url = match url {
+                Some(v) => v.to_string(),
+                None => saved("webdav_url").await.unwrap_or_default(),
+            };
+            if url.is_empty() {
+                return Err(AppError::BadRequest("请先填写 WebDAV 地址".into()));
+            }
+            let username = s
+                .webdav_username
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_string)
+                .or(saved("webdav_username").await)
+                .unwrap_or_default();
+            let password = s
+                .webdav_password
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .or(saved("webdav_password").await)
+                .unwrap_or_default();
+            crate::store::Backend::WebDav(crate::store::WebDavConfig::new(url, username, password))
+        }
+        "s3" => {
+            let endpoint = match s.s3_endpoint.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                Some(v) => v.to_string(),
+                None => saved("s3_endpoint").await.unwrap_or_default(),
+            };
+            let bucket = match s.s3_bucket.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                Some(v) => v.to_string(),
+                None => saved("s3_bucket").await.unwrap_or_default(),
+            };
+            let region = s
+                .s3_region
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .or(saved("s3_region").await)
+                .unwrap_or_default();
+            let access_key = match s.s3_access_key.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                Some(v) => v.to_string(),
+                None => saved("s3_access_key").await.unwrap_or_default(),
+            };
+            let secret_key = s
+                .s3_secret_key
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .or(saved("s3_secret_key").await)
+                .unwrap_or_default();
+            let path_style = match s.s3_path_style {
+                Some(v) => v,
+                None => saved("s3_path_style").await.as_deref() != Some("0"),
+            };
+            crate::store::Backend::S3(crate::store::S3Config::new(
+                endpoint, bucket, region, access_key, secret_key, path_style,
+            ))
+        }
+        _ => return Err(AppError::BadRequest("存储后端只能是 local / webdav / s3".into())),
+    };
+    match backend.probe().await {
+        Ok(()) => Ok(Json(json!({ "ok": true, "message": "连接成功" }))),
+        Err(e) => Ok(Json(json!({ "ok": false, "message": e }))),
+    }
 }
 
 pub async fn upload_favicon(

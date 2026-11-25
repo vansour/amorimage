@@ -6,9 +6,12 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8.9", features = ["multipart"] }
 blake3 = "1.8.7"
-image = "0.25.10"
+bytes = "1.12.2"
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 mime_guess = "2.0.5"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rust-embed = "8.14.0"
+rusty-s3 = "0.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sqlx = { version = "0.9.1", default-features = false, features = ["macros", "runtime-tokio", "sqlite"] }
@@ -17,4 +20,5 @@ tokio = { version = "1.54.1", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.9"
 webp = "0.3.1"

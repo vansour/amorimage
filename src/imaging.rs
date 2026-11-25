@@ -1,7 +1,8 @@
 use std::io::Cursor;
 
 use image::codecs::{jpeg::JpegEncoder, webp::WebPDecoder};
-use image::{DynamicImage, ImageFormat, ImageReader};
+use image::error::LimitErrorKind;
+use image::{DynamicImage, ImageError, ImageFormat, ImageReader, Limits};
 
 pub struct ProcessedImage {
     /// 落盘存储的原始文件内容（GIF 与动图为上传原件，静图已重编码去元数据）
@@ -17,11 +18,16 @@ const THUMB_EDGE: u32 = 420;
 const JPEG_QUALITY: u8 = 90;
 const WEBP_QUALITY: f32 = 85.0;
 const THUMB_QUALITY: f32 = 80.0;
+/// 单边像素上限。解码缓冲约 4 字节/像素，16384 见方即约 1GB，再大没有实际意义，
+/// 且能把声明超大尺寸的小文件挡在分配之前
+const MAX_EDGE: u32 = 16384;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImagingError {
     #[error("仅支持 PNG / JPEG / GIF / WebP 格式")]
     Unsupported,
+    #[error("图片尺寸超过 {MAX_EDGE} 像素上限{}", .0.as_ref().map(|d| format!("（{}×{}）", d.0, d.1)).unwrap_or_default())]
+    TooLarge(Option<(u32, u32)>),
     #[error("无法解码为有效图片: {0}")]
     Decode(String),
     #[error("图片编码失败: {0}")]
@@ -29,7 +35,7 @@ pub enum ImagingError {
 }
 
 pub fn process(bytes: &[u8]) -> Result<ProcessedImage, ImagingError> {
-    let reader = ImageReader::new(Cursor::new(bytes))
+    let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| ImagingError::Decode(e.to_string()))?;
     let Some(format) = reader.format() else {
@@ -43,8 +49,25 @@ pub fn process(bytes: &[u8]) -> Result<ProcessedImage, ImagingError> {
         _ => return Err(ImagingError::Unsupported),
     };
 
-    let img = image::load_from_memory_with_format(bytes, format)
-        .map_err(|e| ImagingError::Decode(e.to_string()))?;
+    // 先只读头部拿尺寸：PNG/JPEG/GIF 的 set_limits 是严格限制，恶意文件
+    // 声明 5 万见方时会在分配像素缓冲之前就被拒，而不是把内存打满
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_EDGE);
+    limits.max_image_height = Some(MAX_EDGE);
+    reader.limits(limits);
+    let img = match reader.decode() {
+        Ok(img) => img,
+        Err(ImageError::Limits(e)) if matches!(e.kind(), LimitErrorKind::DimensionError) => {
+            // 能读到真实尺寸就带上，读不到（PNG 的 hlimit 在构造期就拒）只报上限
+            let dims = ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|r| r.into_dimensions().ok())
+                .filter(|(w, h)| *w <= MAX_EDGE && *h <= MAX_EDGE);
+            return Err(ImagingError::TooLarge(dims));
+        }
+        Err(e) => return Err(ImagingError::Decode(e.to_string())),
+    };
     let (width, height) = (img.width(), img.height());
     if width == 0 || height == 0 {
         return Err(ImagingError::Decode("图片尺寸为 0".into()));

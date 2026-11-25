@@ -8,6 +8,7 @@ services:
     environment:
       AMOR_BIND: 0.0.0.0:3000
       AMOR_DB_DIR: /var/lib/amorimage/db
+      # 本地存储后端用的目录；改用 WebDAV / S3 后这个目录只在回读旧图时用到
       AMOR_STORAGE_DIR: /var/lib/amorimage/storage
       # 访问令牌从同目录 .env 读取（compose 自动加载；参考 .env.example），
       # 留空或没有 .env 则为开放模式

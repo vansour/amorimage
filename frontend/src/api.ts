@@ -1,4 +1,11 @@
-import type { ImageInfo, ListResponse, SiteSettings, Theme, UploadResult } from './types'
+import type {
+  ImageInfo,
+  ListResponse,
+  SiteSettings,
+  StorageBackend,
+  Theme,
+  UploadResult,
+} from './types'
 
 export async function getSettings(): Promise<SiteSettings> {
   const r = await fetch('/api/settings')
@@ -6,11 +13,26 @@ export async function getSettings(): Promise<SiteSettings> {
   return r.json()
 }
 
+/** 留空的密码 / 密钥不发送，表示保留原值 */
+export interface StoragePatch {
+  backend?: StorageBackend
+  webdav_url?: string
+  webdav_username?: string
+  webdav_password?: string
+  s3_endpoint?: string
+  s3_bucket?: string
+  s3_region?: string
+  s3_access_key?: string
+  s3_secret_key?: string
+  s3_path_style?: boolean
+}
+
 export async function updateSettings(patch: {
   title?: string
   theme?: Theme
   max_file_mb?: number
   max_body_mb?: number
+  storage?: StoragePatch
 }): Promise<void> {
   const r = await fetch('/api/settings', {
     method: 'PUT',
@@ -21,6 +43,19 @@ export async function updateSettings(patch: {
     const body = await r.json().catch(() => null)
     throw new Error(body?.error ?? `保存失败 (${r.status})`)
   }
+}
+
+export async function probeStorage(
+  storage: StoragePatch,
+): Promise<{ ok: boolean; message: string }> {
+  const r = await fetch('/api/settings/storage/probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ storage }),
+  })
+  const body = await r.json().catch(() => null)
+  if (!r.ok) throw new Error(body?.error ?? `测试失败 (${r.status})`)
+  return body
 }
 
 export async function uploadFavicon(file: File): Promise<void> {

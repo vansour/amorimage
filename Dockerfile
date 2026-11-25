@@ -18,6 +18,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/amorimage /amorimage
 
 FROM debian:trixie-slim
+# 调用 WebDAV / S3 走 HTTPS 需要根证书；slim 镜像没带，缺了连 HTTP 客户端都建不出来
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /amorimage /usr/local/bin/amorimage
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin amorimage \

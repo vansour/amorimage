@@ -7,6 +7,7 @@ mod imaging;
 mod routes;
 mod settings;
 mod state;
+mod store;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post, put};
@@ -51,6 +52,7 @@ async fn main() {
             "/api/settings",
             get(settings::get).put(settings::update),
         )
+        .route("/api/settings/storage/probe", post(settings::probe_storage))
         .route(
             "/api/settings/favicon",
             put(settings::upload_favicon)

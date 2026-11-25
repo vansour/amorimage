@@ -15,6 +15,9 @@ pub struct ImageRow {
     pub size: i64,
     pub thumb_size: i64,
     pub created_at: i64,
+    /// 上传时所用的存储后端（local/webdav/s3）；空串表示旧数据，按当前后端读
+    #[serde(skip)]
+    pub backend: String,
 }
 
 pub struct NewImage<'a> {
@@ -27,6 +30,8 @@ pub struct NewImage<'a> {
     pub size: u64,
     pub thumb_size: u64,
     pub created_at: i64,
+    /// 落库时的存储后端标识，之后切后端也能按记录找回文件
+    pub backend: &'a str,
 }
 
 pub async fn init(cfg: &Config) -> Result<SqlitePool, sqlx::Error> {
@@ -49,11 +54,23 @@ pub async fn init(cfg: &Config) -> Result<SqlitePool, sqlx::Error> {
             height      INTEGER NOT NULL,
             size        INTEGER NOT NULL,
             thumb_size  INTEGER NOT NULL,
-            created_at  INTEGER NOT NULL
+            created_at  INTEGER NOT NULL,
+            backend     TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
     .await?;
+    // 早期版本的库没有 backend 列：补上，旧记录留空串表示「跟随当前设置」
+    let has_backend = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('images') WHERE name = 'backend'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    if has_backend == 0 {
+        sqlx::query("ALTER TABLE images ADD COLUMN backend TEXT NOT NULL DEFAULT ''")
+            .execute(&pool)
+            .await?;
+    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
@@ -142,8 +159,8 @@ pub async fn find_by_id(pool: &SqlitePool, id: i64) -> Result<Option<ImageRow>, 
 pub async fn insert(pool: &SqlitePool, img: &NewImage<'_>) -> Result<i64, sqlx::Error> {
     let res = sqlx::query(
         "INSERT INTO images
-            (hash, orig_name, ext, mime, width, height, size, thumb_size, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?)",
+            (hash, orig_name, ext, mime, width, height, size, thumb_size, created_at, backend)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(img.hash)
     .bind(img.orig_name)
@@ -154,6 +171,7 @@ pub async fn insert(pool: &SqlitePool, img: &NewImage<'_>) -> Result<i64, sqlx::
     .bind(img.size as i64)
     .bind(img.thumb_size as i64)
     .bind(img.created_at)
+    .bind(img.backend)
     .execute(pool)
     .await?;
     Ok(res.last_insert_rowid())

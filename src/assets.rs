@@ -15,10 +15,10 @@ pub async fn serve_static(uri: Uri) -> Response {
         return asset(path, &file.data);
     }
     // SPA 回退：不带扩展名的路径一律交给前端路由
-    if !path.contains('.') {
-        if let Some(file) = Assets::get(INDEX) {
-            return asset(INDEX, &file.data);
-        }
+    if !path.contains('.')
+        && let Some(file) = Assets::get(INDEX)
+    {
+        return asset(INDEX, &file.data);
     }
     if Assets::get(INDEX).is_some() {
         // 前端已构建，只是这个资源不存在

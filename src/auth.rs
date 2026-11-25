@@ -25,34 +25,29 @@ fn token_matches(expected: &str, provided: &str) -> bool {
 
 fn cookie_value(parts: &Parts, name: &str) -> Option<String> {
     let header = parts.headers.get(header::COOKIE)?.to_str().ok()?;
-    for pair in header.split(';') {
-        if let Some((k, v)) = pair.trim().split_once('=') {
-            if k == name {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+    header.split(';').find_map(|pair| {
+        let (k, v) = pair.trim().split_once('=')?;
+        (k == name).then(|| v.to_string())
+    })
 }
 
 fn is_authed(state: &AppState, parts: &Parts) -> bool {
     let Some(expected) = state.cfg.token.as_deref() else {
         return true;
     };
-    if let Some(cookie) = cookie_value(parts, COOKIE_NAME) {
-        if token_matches(expected, &cookie) {
-            return true;
-        }
+    if let Some(cookie) = cookie_value(parts, COOKIE_NAME)
+        && token_matches(expected, &cookie)
+    {
+        return true;
     }
     if let Some(bearer) = parts
         .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        && token_matches(expected, bearer)
     {
-        if token_matches(expected, bearer) {
-            return true;
-        }
+        return true;
     }
     false
 }

@@ -311,7 +311,8 @@ button:focus-visible,
   min-width: 96px;
 }
 
-.form-row input[type='text'] {
+.form-row input[type='text'],
+.form-row input[type='password'] {
   flex: 1;
   min-width: 220px;
   font: inherit;
@@ -333,9 +334,15 @@ button:focus-visible,
 }
 
 .form-row input[type='text']:focus,
+.form-row input[type='password']:focus,
 .form-row input[type='number']:focus {
   outline: 2px solid var(--rose);
   outline-offset: -1px;
+}
+
+.form-row input::placeholder {
+  color: var(--muted);
+  opacity: 1;
 }
 
 .form-row input[type='file'] {

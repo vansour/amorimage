@@ -10,6 +10,7 @@ use crate::db::{self, ImageRow, NewImage};
 use crate::error::AppError;
 use crate::imaging::{self, ProcessedImage};
 use crate::state::AppState;
+use crate::store;
 
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 
@@ -134,21 +135,24 @@ async fn store_one(st: &AppState, name: &str, data: Bytes) -> Result<UploadItem,
         .map_err(|e| e.to_string())?;
     let file_name = format!("{hash}.{}", proc.ext);
     let thumb_name = format!("{hash}.webp");
-    let img_path = st.cfg.storage_dir.join("images").join(&file_name);
-    let thumb_path = st.cfg.storage_dir.join("thumbs").join(&thumb_name);
+    let size = proc.bytes.len() as u64;
+    let thumb_size = proc.thumb.len() as u64;
+    let backend = store::backend(st).await.map_err(|e| e.to_string())?;
 
-    tokio::fs::write(&img_path, &proc.bytes)
+    backend
+        .put("images", &file_name, proc.bytes.into())
         .await
-        .map_err(|e| format!("写入文件失败: {e}"))?;
-    if let Err(e) = tokio::fs::write(&thumb_path, &proc.thumb).await {
-        let _ = tokio::fs::remove_file(&img_path).await;
-        return Err(format!("写入缩略图失败: {e}"));
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = backend.put("thumbs", &thumb_name, proc.thumb.into()).await {
+        backend.delete("images", &file_name).await;
+        return Err(e.to_string());
     }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| format!("系统时间异常: {e}"))?
         .as_millis() as i64;
+    let backend_name = store::backend_name(st).await;
     let new = NewImage {
         hash: &hash,
         orig_name: name,
@@ -156,9 +160,10 @@ async fn store_one(st: &AppState, name: &str, data: Bytes) -> Result<UploadItem,
         mime: proc.mime,
         width: proc.width,
         height: proc.height,
-        size: proc.bytes.len() as u64,
-        thumb_size: proc.thumb.len() as u64,
+        size,
+        thumb_size,
         created_at: now,
+        backend: &backend_name,
     };
     let id = match db::insert(&st.pool, &new).await {
         Ok(id) => id,
@@ -179,9 +184,10 @@ async fn store_one(st: &AppState, name: &str, data: Bytes) -> Result<UploadItem,
         mime: proc.mime.to_string(),
         width: proc.width as i64,
         height: proc.height as i64,
-        size: proc.bytes.len() as i64,
-        thumb_size: proc.thumb.len() as i64,
+        size: size as i64,
+        thumb_size: thumb_size as i64,
         created_at: now,
+        backend: backend_name,
     };
     Ok(UploadItem {
         name: name.to_string(),
@@ -218,13 +224,12 @@ pub async fn delete_image(
     let row = db::find_by_id(&st.pool, id)
         .await?
         .ok_or_else(|| AppError::NotFound("图片不存在".into()))?;
-    let _ = tokio::fs::remove_file(
-        st.cfg.storage_dir.join("images").join(format!("{}.{}", row.hash, row.ext)),
-    )
-    .await;
-    let _ = tokio::fs::remove_file(st.cfg.storage_dir.join("thumbs").join(format!("{}.webp", row.hash)))
-        .await;
+    // 先删记录再删文件：文件删除失败最多留孤儿文件（可清理），
+    // 反过来会在删库失败时留下「列表里有、点开 404」的坏记录
     db::delete(&st.pool, id).await?;
+    let backend = store::backend_for(&st, &row.backend).await?;
+    backend.delete("images", &format!("{}.{}", row.hash, row.ext)).await;
+    backend.delete("thumbs", &format!("{}.webp", row.hash)).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -254,10 +259,13 @@ pub(crate) fn is_public_asset(path: &str) -> bool {
 }
 
 async fn serve_file(st: &AppState, sub: &str, fname: &str, mime: &str) -> Result<Response, AppError> {
-    let path = st.cfg.storage_dir.join(sub).join(fname);
-    let data = tokio::fs::read(&path)
-        .await
-        .map_err(|_| AppError::NotFound("文件不存在".into()))?;
+    // 文件可能停在旧后端上：先看记录里记的后端，旧数据才回落到当前设置
+    let hash = fname.rsplit_once('.').map(|(h, _)| h).unwrap_or(fname);
+    let backend = match db::find_by_hash(&st.pool, hash).await? {
+        Some(row) => store::backend_for(st, &row.backend).await?,
+        None => store::backend(st).await?,
+    };
+    let data = backend.get(sub, fname).await?;
     Ok((
         StatusCode::OK,
         [
