@@ -7,9 +7,12 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::cleanup;
 use crate::db;
 use crate::error::AppError;
+use crate::migrate;
 use crate::state::AppState;
+use crate::store;
 
 const MAX_FAVICON_BYTES: usize = 10 * 1024 * 1024;
 
@@ -23,7 +26,7 @@ pub async fn get(State(st): State<AppState>) -> Result<Json<serde_json::Value>, 
     let max_file_mb = stored_max_file_mb(&st).await;
     let max_body_mb = stored_max_body_mb(&st).await;
     let has_favicon = db::settings_get(&st.pool, "favicon").await?.is_some();
-    let storage = storage_settings(&st).await;
+    let storage = storage_settings(&st).await?;
     Ok(Json(json!({
         "title": title,
         "theme": theme,
@@ -34,34 +37,41 @@ pub async fn get(State(st): State<AppState>) -> Result<Json<serde_json::Value>, 
     })))
 }
 
-/// 存储配置里密钥只回传「是否已设置」，避免从接口把密钥读走
-async fn storage_settings(st: &AppState) -> serde_json::Value {
-    let text = |key: &'static str| {
-        let st = st.clone();
-        async move { setting(&st, key).await.unwrap_or_default() }
-    };
-    json!({
-        "backend": setting(st, "storage_backend").await.unwrap_or_else(|| "local".into()),
-        "webdav_url": text("webdav_url").await,
-        "webdav_username": text("webdav_username").await,
-        "webdav_has_password": db::settings_get(&st.pool, "webdav_password").await.ok().flatten().is_some_and(|v| !v.is_empty()),
-        "s3_endpoint": text("s3_endpoint").await,
-        "s3_bucket": text("s3_bucket").await,
-        "s3_region": text("s3_region").await,
-        "s3_access_key": text("s3_access_key").await,
-        "s3_has_secret": db::settings_get(&st.pool, "s3_secret_key").await.ok().flatten().is_some_and(|v| !v.is_empty()),
-        "s3_path_style": setting(st, "s3_path_style").await.as_deref() != Some("0"),
-    })
+/// 档案配置里密钥只回传「是否已设置」，避免从接口把密钥读走
+async fn storage_settings(st: &AppState) -> Result<serde_json::Value, AppError> {
+    let active = store::active_profile_id(st).await?;
+    let rows = db::storage_profiles(&st.pool).await?;
+    let mut profiles = Vec::with_capacity(rows.len());
+    for row in &rows {
+        profiles.push(profile_json(st, row).await);
+    }
+    Ok(json!({
+        "active": active,
+        "profiles": profiles,
+        "migration": st.migrate.progress(),
+        "pending": db::count_pending_move(&st.pool, active).await?,
+    }))
 }
 
-async fn setting(st: &AppState, key: &'static str) -> Option<String> {
-    db::settings_get(&st.pool, key)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| String::from_utf8(v).ok())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+async fn profile_json(st: &AppState, row: &db::ProfileRow) -> serde_json::Value {
+    let cfg: serde_json::Value = serde_json::from_str(&row.config).unwrap_or_default();
+    let text = |key: &str| cfg.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let count = db::count_by_backend(&st.pool, &row.id.to_string()).await.unwrap_or(0);
+    json!({
+        "id": row.id,
+        "name": row.name,
+        "kind": row.kind,
+        "images": count,
+        "webdav_url": text("url"),
+        "webdav_username": text("username"),
+        "webdav_has_password": !text("password").is_empty(),
+        "s3_endpoint": text("endpoint"),
+        "s3_bucket": text("bucket"),
+        "s3_region": text("region"),
+        "s3_access_key": text("access_key"),
+        "s3_has_secret": !text("secret_key").is_empty(),
+        "s3_path_style": cfg.get("path_style").and_then(|v| v.as_bool()).unwrap_or(true),
+    })
 }
 
 pub async fn stored_title(st: &AppState) -> String {
@@ -113,23 +123,8 @@ pub struct SettingsPatch {
     theme: Option<String>,
     max_file_mb: Option<u64>,
     max_body_mb: Option<u64>,
-    #[serde(default)]
-    storage: Option<StoragePatch>,
-}
-
-#[derive(Deserialize)]
-pub struct StoragePatch {
-    backend: Option<String>,
-    webdav_url: Option<String>,
-    webdav_username: Option<String>,
-    /// 传空字符串表示保留原密码，单独传 clear 才清空
-    webdav_password: Option<String>,
-    s3_endpoint: Option<String>,
-    s3_bucket: Option<String>,
-    s3_region: Option<String>,
-    s3_access_key: Option<String>,
-    s3_secret_key: Option<String>,
-    s3_path_style: Option<bool>,
+    /// 切换当前存储档案
+    active_profile: Option<i64>,
 }
 
 pub async fn update(
@@ -163,150 +158,293 @@ pub async fn update(
         // 0 表示无限制
         db::settings_set(&st.pool, "max_body_mb", mb.to_string().as_bytes()).await?;
     }
-    if let Some(s) = &p.storage {
-        update_storage(&st, s).await?;
+    if let Some(id) = p.active_profile {
+        if db::storage_profile(&st.pool, id).await?.is_none() {
+            return Err(AppError::BadRequest("存储档案不存在".into()));
+        }
+        db::settings_set(&st.pool, "storage_profile", id.to_string().as_bytes()).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn update_storage(st: &AppState, s: &StoragePatch) -> Result<(), AppError> {
-    if let Some(backend) = &s.backend {
-        if !matches!(backend.as_str(), "local" | "webdav" | "s3") {
-            return Err(AppError::BadRequest("存储后端只能是 local / webdav / s3".into()));
-        }
-        db::settings_set(&st.pool, "storage_backend", backend.as_bytes()).await?;
-    }
+// ---------- 存储档案 ----------
 
-    // 地址类配置必须是 http(s)，否则后端每条请求都会失败
-    for (key, value) in [
-        ("webdav_url", &s.webdav_url),
-        ("s3_endpoint", &s.s3_endpoint),
-    ] {
-        if let Some(url) = value {
-            let url = url.trim();
-            if !url.is_empty() && !(url.starts_with("https://") || url.starts_with("http://")) {
-                return Err(AppError::BadRequest(format!("{key} 必须以 http:// 或 https:// 开头")));
+#[derive(Deserialize)]
+pub struct ProfileBody {
+    /// 缺省表示新建
+    id: Option<i64>,
+    name: String,
+    kind: String,
+    webdav_url: Option<String>,
+    webdav_username: Option<String>,
+    /// 留空表示保留原值
+    webdav_password: Option<String>,
+    s3_endpoint: Option<String>,
+    s3_bucket: Option<String>,
+    s3_region: Option<String>,
+    s3_access_key: Option<String>,
+    s3_secret_key: Option<String>,
+    s3_path_style: Option<bool>,
+}
+
+impl ProfileBody {
+    /// 合并已有档案里的密钥：前端不会回显它们，留空即保持不变
+    fn config_json(&self, existing: Option<&serde_json::Value>) -> Result<String, AppError> {
+        let old = |key: &str| {
+            existing
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let text = |v: &Option<String>| v.as_deref().unwrap_or_default().trim().to_string();
+        let secret = |v: &Option<String>, key: &str| {
+            v.as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| old(key))
+        };
+        let require_http = |value: &str, label: &str| -> Result<(), AppError> {
+            if !value.is_empty()
+                && !(value.starts_with("https://") || value.starts_with("http://"))
+            {
+                return Err(AppError::BadRequest(format!("{label} 必须以 http:// 或 https:// 开头")));
             }
-            db::settings_set(&st.pool, key, url.as_bytes()).await?;
-        }
-    }
-    for (key, value) in [
-        ("webdav_username", &s.webdav_username),
-        ("s3_bucket", &s.s3_bucket),
-        ("s3_region", &s.s3_region),
-        ("s3_access_key", &s.s3_access_key),
-    ] {
-        if let Some(v) = value {
-            let v = v.trim();
-            if key == "s3_bucket" && v.contains(['/', '\\', ' ']) {
-                return Err(AppError::BadRequest("存储桶名称不能包含斜杠或空格".into()));
+            Ok(())
+        };
+        let cfg = match self.kind.as_str() {
+            "local" => serde_json::json!({}),
+            "webdav" => {
+                let url = text(&self.webdav_url);
+                require_http(&url, "WebDAV 地址")?;
+                serde_json::json!({
+                    "url": url,
+                    "username": text(&self.webdav_username),
+                    "password": secret(&self.webdav_password, "password"),
+                })
             }
-            db::settings_set(&st.pool, key, v.as_bytes()).await?;
+            "s3" => {
+                let endpoint = text(&self.s3_endpoint);
+                require_http(&endpoint, "S3 Endpoint")?;
+                let bucket = text(&self.s3_bucket);
+                if bucket.contains(['/', '\\', ' ']) {
+                    return Err(AppError::BadRequest("存储桶名称不能包含斜杠或空格".into()));
+                }
+                serde_json::json!({
+                    "endpoint": endpoint,
+                    "bucket": bucket,
+                    "region": text(&self.s3_region),
+                    "access_key": text(&self.s3_access_key),
+                    "secret_key": secret(&self.s3_secret_key, "secret_key"),
+                    "path_style": self.s3_path_style.unwrap_or_else(|| {
+                        existing
+                            .and_then(|v| v.get("path_style"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true)
+                    }),
+                })
+            }
+            _ => return Err(AppError::BadRequest("存储类型只能是 local / webdav / s3".into())),
+        };
+        Ok(cfg.to_string())
+    }
+}
+
+pub async fn save_profile(
+    State(st): State<AppState>,
+    Json(body): Json<ProfileBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("请填写档案名称".into()));
+    }
+    if name.chars().count() > 40 {
+        return Err(AppError::BadRequest("档案名称最多 40 个字符".into()));
+    }
+    let existing = match body.id {
+        Some(id) => {
+            let row = db::storage_profile(&st.pool, id)
+                .await?
+                .ok_or_else(|| AppError::NotFound("存储档案不存在".into()))?;
+            if row.kind != body.kind {
+                return Err(AppError::BadRequest("不能修改已有档案的存储类型".into()));
+            }
+            Some(serde_json::from_str::<serde_json::Value>(&row.config).unwrap_or_default())
         }
+        None => None,
+    };
+    let config = body.config_json(existing.as_ref())?;
+    let id = match body.id {
+        Some(id) => {
+            db::storage_profile_update(&st.pool, id, name, &config).await?;
+            id
+        }
+        None => db::storage_profile_insert(&st.pool, name, &body.kind, &config).await?,
+    };
+    Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+pub struct ProfileQuery {
+    id: i64,
+}
+
+pub async fn delete_profile(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ProfileQuery>,
+) -> Result<StatusCode, AppError> {
+    let id = q.id;
+    let active = store::active_profile_id(&st).await?;
+    if id == active {
+        return Err(AppError::BadRequest(
+            "不能删除正在使用的档案，请先切换到别的档案".into(),
+        ));
     }
-    // 密钥留空表示不改动，避免前端回显密钥的往返把它们清空
-    if let Some(pw) = s.webdav_password.as_ref().filter(|v| !v.is_empty()) {
-        db::settings_set(&st.pool, "webdav_password", pw.as_bytes()).await?;
+    let stored = db::count_by_backend(&st.pool, &id.to_string()).await?;
+    if stored > 0 {
+        return Err(AppError::BadRequest(format!(
+            "该档案上还有 {stored} 张图片，请先迁移到别的档案再删除"
+        )));
     }
-    if let Some(secret) = s.s3_secret_key.as_ref().filter(|v| !v.is_empty()) {
-        db::settings_set(&st.pool, "s3_secret_key", secret.as_bytes()).await?;
-    }
-    if let Some(path_style) = s.s3_path_style {
-        db::settings_set(&st.pool, "s3_path_style", if path_style { b"1" } else { b"0" }).await?;
-    }
-    Ok(())
+    db::storage_profile_delete(&st.pool, id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
 pub struct ProbeBody {
-    storage: StoragePatch,
+    /// 试连已保存的档案
+    id: Option<i64>,
+    /// 试连尚未保存的配置
+    profile: Option<ProfileBody>,
 }
 
-/// 用请求里带的配置直接试连，不必先保存——避免把错配置落库、影响正在用的上传
+/// 用请求里带的配置或已存档案直接试连，不必先保存
 pub async fn probe_storage(
     State(st): State<AppState>,
     Json(body): Json<ProbeBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let s = &body.storage;
-    let backend = s
-        .backend
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("缺少存储后端类型".into()))?;
-    let saved = |key: &'static str| {
-        let st = st.clone();
-        async move { setting(&st, key).await }
+    let (kind, config) = match (body.id, body.profile) {
+        (Some(id), _) => {
+            let row = db::storage_profile(&st.pool, id)
+                .await?
+                .ok_or_else(|| AppError::NotFound("存储档案不存在".into()))?;
+            (row.kind, row.config)
+        }
+        (None, Some(p)) => {
+            // 编辑已有档案时密钥框是空的：沿用已保存的值，否则试连必然失败
+            let existing = match p.id {
+                Some(id) => db::storage_profile(&st.pool, id)
+                    .await?
+                    .and_then(|row| serde_json::from_str::<serde_json::Value>(&row.config).ok()),
+                None => None,
+            };
+            (p.kind.clone(), p.config_json(existing.as_ref())?)
+        }
+        (None, None) => return Err(AppError::BadRequest("缺少要测试的存储配置".into())),
     };
-    let backend = match backend {
-        "local" => {
-            return Ok(Json(json!({ "ok": true, "message": "本地磁盘可用" })));
-        }
-        "webdav" => {
-            let url = s.webdav_url.as_deref().map(str::trim).filter(|v| !v.is_empty());
-            let url = match url {
-                Some(v) => v.to_string(),
-                None => saved("webdav_url").await.unwrap_or_default(),
-            };
-            if url.is_empty() {
-                return Err(AppError::BadRequest("请先填写 WebDAV 地址".into()));
-            }
-            let username = s
-                .webdav_username
-                .as_deref()
-                .map(str::trim)
-                .map(str::to_string)
-                .or(saved("webdav_username").await)
-                .unwrap_or_default();
-            let password = s
-                .webdav_password
-                .as_deref()
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-                .or(saved("webdav_password").await)
-                .unwrap_or_default();
-            crate::store::Backend::WebDav(crate::store::WebDavConfig::new(url, username, password))
-        }
-        "s3" => {
-            let endpoint = match s.s3_endpoint.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-                Some(v) => v.to_string(),
-                None => saved("s3_endpoint").await.unwrap_or_default(),
-            };
-            let bucket = match s.s3_bucket.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-                Some(v) => v.to_string(),
-                None => saved("s3_bucket").await.unwrap_or_default(),
-            };
-            let region = s
-                .s3_region
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-                .or(saved("s3_region").await)
-                .unwrap_or_default();
-            let access_key = match s.s3_access_key.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-                Some(v) => v.to_string(),
-                None => saved("s3_access_key").await.unwrap_or_default(),
-            };
-            let secret_key = s
-                .s3_secret_key
-                .as_deref()
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-                .or(saved("s3_secret_key").await)
-                .unwrap_or_default();
-            let path_style = match s.s3_path_style {
-                Some(v) => v,
-                None => saved("s3_path_style").await.as_deref() != Some("0"),
-            };
-            crate::store::Backend::S3(crate::store::S3Config::new(
-                endpoint, bucket, region, access_key, secret_key, path_style,
-            ))
-        }
-        _ => return Err(AppError::BadRequest("存储后端只能是 local / webdav / s3".into())),
+    let row = db::ProfileRow {
+        id: 0,
+        name: String::new(),
+        kind: kind.clone(),
+        config,
     };
+    let backend = store::from_profile(&st.cfg.storage_dir, &row)?;
     match backend.probe().await {
         Ok(()) => Ok(Json(json!({ "ok": true, "message": "连接成功" }))),
         Err(e) => Ok(Json(json!({ "ok": false, "message": e }))),
     }
+}
+
+#[derive(Deserialize)]
+pub struct MigrateBody {
+    /// 目标档案；缺省为当前档案
+    target: Option<i64>,
+    /// 成功搬完后删掉源文件
+    #[serde(default)]
+    delete_source: bool,
+}
+
+pub async fn start_migration(
+    State(st): State<AppState>,
+    Json(body): Json<MigrateBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let target = match body.target {
+        Some(id) => id,
+        None => store::active_profile_id(&st).await?,
+    };
+    migrate::start(&st, target, body.delete_source).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn migration_progress(
+    State(st): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let active = store::active_profile_id(&st).await?;
+    Ok(Json(json!({
+        "migration": st.migrate.progress(),
+        "pending": db::count_pending_move(&st.pool, active).await?,
+    })))
+}
+
+pub async fn cancel_migration(
+    State(st): State<AppState>,
+) -> Result<StatusCode, AppError> {
+    if !st.migrate.cancel() {
+        return Err(AppError::BadRequest("没有正在进行的迁移任务".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct CleanupBody {
+    /// 要清理的档案；缺省为当前档案
+    profile: Option<i64>,
+    /// true 才真正删除；默认只预演
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn cleanup_target(st: &AppState, profile: Option<i64>) -> Result<i64, AppError> {
+    match profile {
+        Some(id) => Ok(id),
+        None => store::active_profile_id(st).await,
+    }
+}
+
+/// 预演：后台扫描并统计该档案上的孤儿文件，不删任何东西
+pub async fn scan_orphans(
+    State(st): State<AppState>,
+    Json(body): Json<CleanupBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let id = cleanup_target(&st, body.profile).await?;
+    cleanup::start_scan(&st, id).await?;
+    Ok(Json(json!({ "profile": id, "started": true })))
+}
+
+/// 真正删除孤儿。前端必须在预演后二次确认才会走到这里
+pub async fn delete_orphans(
+    State(st): State<AppState>,
+    Json(body): Json<CleanupBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !body.confirm {
+        return Err(AppError::BadRequest("缺少确认标记，未删除任何文件".into()));
+    }
+    let id = cleanup_target(&st, body.profile).await?;
+    cleanup::start_delete(&st, id).await?;
+    Ok(Json(json!({ "profile": id, "started": true })))
+}
+
+pub async fn cleanup_progress(
+    State(st): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(json!({ "cleanup": st.cleanup.progress() })))
+}
+
+pub async fn cancel_cleanup(State(st): State<AppState>) -> Result<StatusCode, AppError> {
+    if !st.cleanup.cancel() {
+        return Err(AppError::BadRequest("没有正在进行的清理任务".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn upload_favicon(

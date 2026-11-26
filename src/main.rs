@@ -1,9 +1,11 @@
 mod assets;
 mod auth;
+mod cleanup;
 mod config;
 mod db;
 mod error;
 mod imaging;
+mod migrate;
 mod routes;
 mod settings;
 mod state;
@@ -35,6 +37,8 @@ async fn main() {
     let state = AppState {
         pool: db::init(&cfg).await.expect("初始化数据库失败"),
         cfg: std::sync::Arc::new(cfg),
+        migrate: std::sync::Arc::new(migrate::MigrateState::new()),
+        cleanup: std::sync::Arc::new(cleanup::CleanupState::new()),
     };
 
     // 上传路由关闭 axum 的默认 2MB 传输上限，改由处理器按设置流式检查；
@@ -52,7 +56,24 @@ async fn main() {
             "/api/settings",
             get(settings::get).put(settings::update),
         )
+        .route(
+            "/api/settings/storage/profiles",
+            post(settings::save_profile).delete(settings::delete_profile),
+        )
         .route("/api/settings/storage/probe", post(settings::probe_storage))
+        .route("/api/settings/storage/migrate", post(settings::start_migration))
+        .route("/api/settings/storage/migrate", delete(settings::cancel_migration))
+        .route("/api/settings/storage/migrate/progress", get(settings::migration_progress))
+        .route("/api/settings/storage/orphans", post(settings::scan_orphans))
+        .route("/api/settings/storage/orphans", delete(settings::delete_orphans))
+        .route(
+            "/api/settings/storage/orphans/progress",
+            get(settings::cleanup_progress),
+        )
+        .route(
+            "/api/settings/storage/orphans/cancel",
+            post(settings::cancel_cleanup),
+        )
         .route(
             "/api/settings/favicon",
             put(settings::upload_favicon)

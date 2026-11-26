@@ -1,6 +1,8 @@
 import type {
   ImageInfo,
   ListResponse,
+  CleanupProgress,
+  MigrationProgress,
   SiteSettings,
   StorageBackend,
   Theme,
@@ -14,8 +16,10 @@ export async function getSettings(): Promise<SiteSettings> {
 }
 
 /** 留空的密码 / 密钥不发送，表示保留原值 */
-export interface StoragePatch {
-  backend?: StorageBackend
+export interface ProfilePatch {
+  id?: number
+  name: string
+  kind: StorageBackend
   webdav_url?: string
   webdav_username?: string
   webdav_password?: string
@@ -32,7 +36,7 @@ export async function updateSettings(patch: {
   theme?: Theme
   max_file_mb?: number
   max_body_mb?: number
-  storage?: StoragePatch
+  active_profile?: number
 }): Promise<void> {
   const r = await fetch('/api/settings', {
     method: 'PUT',
@@ -45,17 +49,108 @@ export async function updateSettings(patch: {
   }
 }
 
+export async function saveProfile(profile: ProfilePatch): Promise<number> {
+  const r = await fetch('/api/settings/storage/profiles', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(profile),
+  })
+  const body = await r.json().catch(() => null)
+  if (!r.ok) throw new Error(body?.error ?? `保存失败 (${r.status})`)
+  return body.id
+}
+
+export async function deleteProfile(id: number): Promise<void> {
+  const r = await fetch(`/api/settings/storage/profiles?id=${id}`, { method: 'DELETE' })
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error ?? `删除失败 (${r.status})`)
+  }
+}
+
 export async function probeStorage(
-  storage: StoragePatch,
+  target: { id: number } | { profile: ProfilePatch },
 ): Promise<{ ok: boolean; message: string }> {
   const r = await fetch('/api/settings/storage/probe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ storage }),
+    body: JSON.stringify(target),
   })
   const body = await r.json().catch(() => null)
   if (!r.ok) throw new Error(body?.error ?? `测试失败 (${r.status})`)
   return body
+}
+
+export async function startMigration(
+  target: number | null,
+  deleteSource: boolean,
+): Promise<void> {
+  const r = await fetch('/api/settings/storage/migrate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target, delete_source: deleteSource }),
+  })
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error ?? `启动迁移失败 (${r.status})`)
+  }
+}
+
+export async function cancelMigration(): Promise<void> {
+  const r = await fetch('/api/settings/storage/migrate', { method: 'DELETE' })
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error ?? `取消迁移失败 (${r.status})`)
+  }
+}
+
+export async function getMigrationProgress(): Promise<{
+  migration: MigrationProgress
+  pending: number
+}> {
+  const r = await fetch('/api/settings/storage/migrate/progress')
+  if (!r.ok) throw new Error(`读取迁移进度失败 (${r.status})`)
+  return r.json()
+}
+
+/** 预演：后台扫描孤儿，不删任何东西。进度走 getCleanupProgress */
+export async function scanOrphans(profile: number): Promise<void> {
+  const r = await fetch('/api/settings/storage/orphans', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profile }),
+  })
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error ?? `扫描失败 (${r.status})`)
+  }
+}
+
+/** 真正删除；必须显式传 confirm。进度走 getCleanupProgress */
+export async function deleteOrphans(profile: number): Promise<void> {
+  const r = await fetch('/api/settings/storage/orphans', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profile, confirm: true }),
+  })
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error ?? `清理失败 (${r.status})`)
+  }
+}
+
+export async function getCleanupProgress(): Promise<CleanupProgress> {
+  const r = await fetch('/api/settings/storage/orphans/progress')
+  if (!r.ok) throw new Error(`读取清理进度失败 (${r.status})`)
+  return (await r.json()).cleanup
+}
+
+export async function cancelCleanup(): Promise<void> {
+  const r = await fetch('/api/settings/storage/orphans/cancel', { method: 'POST' })
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error ?? `停止清理失败 (${r.status})`)
+  }
 }
 
 export async function uploadFavicon(file: File): Promise<void> {

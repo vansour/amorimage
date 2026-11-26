@@ -137,7 +137,9 @@ async fn store_one(st: &AppState, name: &str, data: Bytes) -> Result<UploadItem,
     let thumb_name = format!("{hash}.webp");
     let size = proc.bytes.len() as u64;
     let thumb_size = proc.thumb.len() as u64;
-    let backend = store::backend(st).await.map_err(|e| e.to_string())?;
+    // 先定住档案再动笔：中途切换存储设置时，记录仍与文件落点一致
+    let backend_name = store::active_profile_id(st).await.map_err(|e| e.to_string())?.to_string();
+    let backend = store::backend_for(st, &backend_name).await.map_err(|e| e.to_string())?;
 
     backend
         .put("images", &file_name, proc.bytes.into())
@@ -148,11 +150,7 @@ async fn store_one(st: &AppState, name: &str, data: Bytes) -> Result<UploadItem,
         return Err(e.to_string());
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("系统时间异常: {e}"))?
-        .as_millis() as i64;
-    let backend_name = store::backend_name(st).await;
+    let now = db::now_ms();
     let new = NewImage {
         hash: &hash,
         orig_name: name,
@@ -235,7 +233,7 @@ pub async fn delete_image(
 
 // ---------- 图片服务 ----------
 
-fn parse_name(fname: &str) -> Option<(String, String)> {
+pub(crate) fn parse_name(fname: &str) -> Option<(String, String)> {
     let (hash, ext) = fname.split_once('.')?;
     let valid_hash = !hash.is_empty()
         && hash.len() <= 64
